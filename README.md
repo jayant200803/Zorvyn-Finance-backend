@@ -1,20 +1,192 @@
-# finance-dashboard-backend
+# Finance-dashboard-backend
 
 Backend for a finance dashboard — handles users, roles, financial records, and analytics. Built with Node.js, Express, and MongoDB.
 
 ---
 
+## What this project is
+
+Zrovyn asked for a backend system for a finance dashboard where different users interact with financial records based on their role. The system needed to handle:
+
+- Users with different access levels (not everyone should see or do everything)
+- Financial records — income, expenses, categories, dates
+- Dashboard analytics — summaries, trends, totals
+- Strict control over who can do what
+- Proper validation so bad data never reaches the database
+
+This is the backend engine behind that system. It's a REST API that a frontend app or a tool like Postman can talk to over HTTP.
+
+---
+
+## How a request flows through the system
+
+Every single request goes through the same flow:
+
+```
+Request comes in
+      ↓
+Does it have a valid token?    → No  → 401 Unauthorized
+      ↓ Yes
+Does their role allow this?    → No  → 403 Forbidden
+      ↓ Yes
+Is the data they sent valid?   → No  → 400 Bad Request
+      ↓ Yes
+Talk to MongoDB, do the thing
+      ↓
+Send back a clean JSON response
+```
+
+That's the whole backend in one diagram. Every endpoint follows this exact path.
+
+---
+
 ## Why I built it this way
 
-A few decisions worth calling out upfront:
+**MongoDB over SQL** — financial records are essentially documents. Each one has an amount, a type, a category, a date, and some optional notes. There's no complex relational structure here, so a document store fits naturally. The aggregation pipeline also makes the dashboard analytics queries clean to write — instead of fetching records and calculating totals in JavaScript, we push the calculation down to the database in a single query.
 
-**MongoDB over SQL** — financial records are essentially documents. Each one has an amount, a type, a category, a date, and some optional notes. There's no complex relational structure here, so a document store fits naturally. The aggregation pipeline also makes the dashboard analytics queries clean to write.
+**Service layer** — controllers in this project are intentionally thin. They receive a request, call a service, and send back a response. All the actual logic (filtering, access checks, business rules) lives in the service layer. This makes things easier to test and easier to change later without touching the routing layer.
 
-**Service layer** — controllers in this project are intentionally thin. They receive a request, call a service, and send back a response. All the actual logic (filtering, access checks, business rules) lives in the service layer. This makes things easier to test and easier to change later.
+**Soft deletes at the model level** — instead of sprinkling `isDeleted: false` checks across every query, I hooked into Mongoose's pre-query middleware so deleted records are automatically excluded everywhere. You literally cannot forget it — it's injected at the database layer itself.
 
-**Soft deletes at the model level** — instead of sprinkling `isDeleted: false` checks across every query, I hooked into Mongoose's pre-query middleware so deleted records are automatically excluded everywhere. You can't accidentally forget it.
+**Permission matrix in one file** — `src/config/roles.js` is the single source of truth for who can do what. If access rules change, there's one place to update. No hunting across middleware files.
 
-**Permission matrix in one file** — `src/config/roles.js` is the single source of truth for who can do what. If access rules change, there's one place to update.
+**All validation schemas in one file** — `src/validators/schemas.js` has every Zod schema in the project. You can read the entire validation layer of the app in one place.
+
+**Consistent response envelope** — every response, success or error, follows the same shape. The frontend never has to guess the structure.
+
+---
+
+## File by file explanation
+
+### `server.js` — Entry point
+
+The first file that runs when you start the server. It connects to MongoDB, creates the Express app, and starts listening on a port. It also handles graceful shutdown — when you press Ctrl+C it waits for ongoing requests to finish and closes the database connection cleanly before exiting. Most people skip this. It matters in production.
+
+### `src/app.js` — Express setup
+
+This is the wiring file. It adds security headers via Helmet, sets up CORS, applies rate limiting (100 requests per 15 minutes globally, stricter on the login route to prevent brute force), adds request logging via Morgan, registers all the routes, and puts the 404 and error handlers at the very end. Nothing runs here — it just connects everything.
+
+### `src/config/env.js` — Environment variables
+
+Instead of writing `process.env.JWT_SECRET` scattered across 10 different files, all environment variables are read once here and exported. Every other file imports from here. If a variable is missing or wrong, you find out when the server starts — not when a random request hits a broken route.
+
+### `src/config/roles.js` — The permission system
+
+One of the most important files. It defines two things:
+
+The **hierarchy** — viewer is level 1, analyst is level 2, admin is level 3.
+
+The **permission matrix** — an explicit list of what each role can do:
+```
+RECORDS_READ        → viewer, analyst, admin
+RECORDS_WRITE       → admin only
+RECORDS_DELETE      → admin only
+DASHBOARD_BASIC     → viewer, analyst, admin
+DASHBOARD_ANALYTICS → analyst, admin
+USERS_MANAGE        → admin only
+```
+
+To change who can do something, you change it here. One file, one place.
+
+### `src/db/connection.js` — MongoDB connection
+
+Connects to MongoDB and logs connection events — connected, disconnected, errors. If MongoDB is unreachable when the server starts, this throws an error and the server exits. Better to fail loudly than run in a broken state.
+
+### `src/db/seed.js` — Sample data
+
+The script behind `npm run seed`. Clears existing data, creates 3 users (admin, analyst, viewer), and creates 15 sample financial records spread across different months and categories. Anyone who clones the repo gets real data immediately without manually creating anything.
+
+### `src/models/User.js` — User schema
+
+Defines what a user looks like in MongoDB with some smart behavior built in:
+
+- **Password hashing** — before saving, automatically scrambles the password with bcrypt. Plain text passwords are never stored.
+- **`select: false` on password** — the password field is never returned in any query unless explicitly requested. No risk of accidentally leaking it in a response.
+- **`comparePassword()`** — checks if a given password matches the stored hash. Used only during login.
+- **`toPublicJSON()`** — returns only safe fields. Used whenever user data goes into a response.
+- **`findByEmailWithPassword()`** — the only place in the codebase where the password is fetched. Used only in the login flow.
+
+### `src/models/FinancialRecord.js` — Financial record schema
+
+Defines financial records with two important features:
+
+- **Compound indexes** — created to match the most common query patterns. `{ isDeleted, date }` makes listing records fast even with large datasets. `{ isDeleted, category, type }` makes category analytics fast.
+- **Soft delete query middleware** — hooked into Mongoose so `isDeleted: false` is added automatically to every find and count query. Deleted records are invisible by default across the entire application without anyone having to remember to filter them.
+
+### `src/middleware/auth.js` — Authentication and authorization
+
+Two jobs:
+
+**`authenticate`** — reads the JWT from the Authorization header, verifies it, looks up the user in the database, attaches them to `req.user`. If the token is missing, expired, or the user is deactivated — request stops with a 401.
+
+**`requirePermission('RECORDS_WRITE')`** — checks if the logged-in user's role has the given permission in the matrix. If not, returns 403. This is what sits on every protected route.
+
+**`requireMinRole('analyst')`** — checks by hierarchy number instead. Allows analyst and anyone above.
+
+### `src/middleware/validate.js` — Input validation
+
+Takes a Zod schema and turns it into Express middleware. Instead of writing validation logic inside every controller, you attach it to a route:
+
+```js
+router.post('/records', validate(createRecordSchema), controller.createRecord)
+```
+
+If the request body doesn't match the schema, it returns a 400 with exactly which fields failed and why — before the controller even runs.
+
+### `src/middleware/errorHandler.js` — Global error handling
+
+Catches every error thrown anywhere in the app and turns it into a consistent JSON response. Handles our own typed errors, Mongoose validation errors, duplicate key errors (like a duplicate email), invalid MongoDB ID errors, and anything unexpected. Without this, Express returns HTML error pages or crashes.
+
+### `src/utils/ApiError.js` — Typed errors
+
+Instead of throwing generic errors, we throw typed ones:
+
+```js
+throw ApiError.notFound('User')               // 404
+throw ApiError.forbidden()                    // 403
+throw ApiError.conflict('Email already exists') // 409
+```
+
+Also contains `catchAsync` — wraps every async route handler so errors automatically flow to the error handler without needing try/catch blocks everywhere.
+
+### `src/utils/response.js` — Response helpers
+
+`sendSuccess`, `sendCreated`, `sendPaginated` — every successful response goes through one of these. Guarantees the response shape is always the same regardless of which controller sends it.
+
+### `src/utils/jwt.js` — Token utilities
+
+Three functions: sign a token, verify a token, extract a token from a Bearer header. All JWT logic in one place.
+
+### `src/validators/schemas.js` — All Zod schemas
+
+Every input validation schema in the project lives here — login, create user, update user, create record, list records filters, dashboard filters. Reading this file gives you the complete picture of what data the API accepts.
+
+### The modules — auth, users, records, dashboard
+
+Each module follows the same pattern:
+
+**`routes.js`** — defines URLs, which middleware runs on each route, which controller handles it
+
+**`controller.js`** — receives the request, calls the service, sends the response. Thin by design — no logic here.
+
+**`service.js`** — the actual business logic. Database queries, business rules, error throwing. This is where things actually happen.
+
+For example, `POST /api/v1/records`:
+```
+routes.js      → authenticate → requirePermission → validate → controller
+controller.js  → calls recordsService.createRecord()
+service.js     → saves to MongoDB, returns the created record
+```
+
+### The dashboard service specifically
+
+Worth calling out because it uses MongoDB aggregation pipelines. Instead of fetching all records and doing math in JavaScript, the calculation is pushed to the database:
+
+```
+"Sum all income by month for 2024, grouped by month, sorted chronologically"
+```
+
+MongoDB returns exactly that in one query. This is what powers the monthly trends, weekly trends, category breakdown, and top categories endpoints. It's fast and doesn't get slower as more records are added.
 
 ---
 
